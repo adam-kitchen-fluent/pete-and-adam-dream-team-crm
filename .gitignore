@@ -16,3 +16,9 @@ data/cache/
 # misc
 .DS_Store
 *.log
+
+# next/vercel extras
+next-env.d.ts
+*.tsbuildinfo
+.vercel
+coverage/
