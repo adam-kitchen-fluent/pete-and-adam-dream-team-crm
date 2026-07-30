@@ -1,116 +1,105 @@
-# Fluent Intelligence CRM — Architecture & Build Plan
+# Intelligence CRM for American Data — Architecture v2
 
-> **Thesis:** Not a contact database. A CRM that *thinks ahead of the rep* — every
-> account is continuously enriched from live web signals, scored for likelihood to
-> convert, and turned into ranked next-best-actions that agents can execute.
+> **One-liner:** A CRM that knows what a winnable nursing home looks like, finds them,
+> scores them transparently, and gets sharper every time a deal closes or dies.
 
-Maps directly to the build brief:
+**Customer persona:** American Data — B2B SaaS vendor of a nursing-home EMR suite.
+**Their ICP:** US skilled-nursing facilities (SNFs) and assisted-living facilities (ALFs),
+~50–300 beds, independent or small chains, **not** on PointClickCare, ideally still
+manual/Excel-based. PE-rolled-up chains are a hard disqualifier (they standardize on PCC).
 
-| Brief | System component |
-|---|---|
-| Predictive scoring — rank prospects by likelihood to convert | **Scoring engine** (hybrid model + explainable factors) |
-| Competitive market analysis — win / lose / get undercut | **Competitive Intelligence agent** + market rollup |
-| Next-best action — tell reps what to do next, and why | **Next-Best-Action agent** (rationale-first) |
-| Auto-enriched records — live signals from the open web | **Enrichment pipeline** (live web search + fetch + extract) |
-| As agentic as possible — take action, not just suggest | **Action-executor agents** behind an approval gate |
+## 1. Core concept: the rubric is the soul of the product
 
----
+A **deterministic, transparent ICP rubric** (Clay-style): named yes/no factors with point
+values. Every account gets a 0–100 score with a full per-factor breakdown — no black box.
+Factor weights start as founder assumptions and are **retuned from empirical deal outcomes**
+via the learning engine (below). Everything else — enrichment, nudges, forecast, chatbot —
+hangs off this score.
 
-## 1. Stack
+### Rubric v1 (assumptions — the learning engine's job is to correct these)
 
-- **Next.js 15 (App Router) + TypeScript** — app + API routes + server actions
-- **Tailwind + shadcn/ui** — UI system
-- **Drizzle ORM** — SQLite (libSQL) for local dev, **Postgres (Neon)** for deploy
-- **Anthropic Claude API** — agent reasoning (Opus for orchestration/NBA, Sonnet for high-volume extraction). Model choice per agent; see `claude-api` reference before wiring.
-- **Live web enrichment** — web search + page fetch. *Decision pending:* Anthropic
-  native web-search tool (single vendor) vs **Exa/Tavily** (structured results, better
-  for extraction). Leaning Exa for search + fetch for content.
-- **Durable job runner** — **Inngest** for enrichment/scoring sweeps (survives restarts,
-  gives us the agent-run audit trail for free). Simple cron fallback for the prototype.
-- **Streaming** — Vercel AI SDK / raw Anthropic streaming for live agent-run traces.
+| Key | Signal | Source | Points |
+|---|---|---|---|
+| `bed_sweet_spot` | 50–300 certified beds | CMS | +20 |
+| `facility_type_fit` | SNF or ALF | CMS | +10 |
+| `independent_or_small_chain` | No chain affiliation, or chain ≤ 10 facilities | CMS (affiliated entity) | +15 |
+| `not_on_pcc` | Not using PointClickCare | enrichment (job posts / tech mentions) — **stub** | +25 |
+| `manual_ops` | Still manual / Excel-based ops | enrichment — **stub** | +15 |
+| `new_don` | New Director of Nursing in last ~6 mo | LinkedIn/Apollo — **stub**; CMS admin-departure count as proxy | +20 |
+| `high_turnover` | Total nursing staff turnover above national median | CMS | +10 |
+| `admin_churn` | ≥ 2 administrator departures reported | CMS | +10 |
+| `tech_forward_don` | DON profile reads tech-forward | LLM read of profile — **stub** | +5 |
+| `pe_rollup` | Large chain (> 20 facilities) / PE-owned | CMS chain size + ownership | **disqualifier** |
+| `recent_ownership_change` | Ownership changed in last 12 mo (rollup risk) | CMS | −10 |
 
-## 2. Data model (core entities)
+Score bands: **hot ≥ 70 · warm 40–69 · cold < 40 · disqualified** (any strike).
 
-- **Account** — company: name, domain, industry, size, region, stage, owner, icpFit
-- **Contact** — person at an account
-- **Signal** — one enrichment fact from the web:
-  `{ accountId, type, title, summary, sourceUrl, publishedAt, fetchedAt, importance, sentiment, rawExcerpt }`
-  Types: `funding · hiring · leadership_change · product_launch · competitor_mention ·
-  layoffs · expansion · earnings · tech_stack · news · review · social`.
-  **Every signal carries its source URL + fetch timestamp — no unsourced claims.**
-- **Score** — `{ accountId, value 0–100, band hot/warm/cold, computedAt, factors[] }`
-  where each factor has `{ label, weight, contribution, explanation }`.
-- **CompetitiveInsight** — `{ accountId, competitor, position winning|losing|undercut,
-  evidenceSignalIds[], recommendation }`.
-- **NextBestAction** — `{ accountId, type, title, rationale, priority,
-  status suggested|approved|executing|done|failed, payload, agentRunId }`.
-- **AgentRun** — `{ id, agentType, accountId, trigger, status, steps[], tokensUsed,
-  startedAt, finishedAt, output }` — every tool call + observation logged for trust.
+## 2. Data strategy (CMS-first)
 
-## 3. Agent architecture (the "agentic" core)
+1. **CMS Care Compare provider data** (free, public, ~14k certified nursing homes):
+   beds, facility type, ownership type, chain affiliation, staffing turnover,
+   administrator departures, ownership changes, star ratings. This seeds the **entire
+   account universe with most of the rubric pre-populated** — deterministic and $0.
+2. **Apollo** *(stubbed — waiting on key)*: contacts layer — find the DON/administrator,
+   emails, LinkedIn; employee counts.
+3. **Apify / Google Maps** *(stubbed — waiting on key)*: gap-filler for ALFs, which are
+   state-regulated and thin in CMS data.
+4. **LLM enrichment** (Anthropic): only for fuzzy signals — PCC detection from job
+   postings, "tech-forward DON" reads, news.
 
-A small fleet, orchestrated per-account or per-sweep:
+All connectors implement one interface (`src/lib/connectors/types.ts`) so swapping
+stub → live is a drop-in.
 
-1. **Enrichment agent** — given name + domain, runs live web searches, fetches pages,
-   extracts structured `Signal`s, dedupes against existing, writes to the record.
-   On-demand button first, then scheduled sweeps.
-2. **Scoring agent** — hybrid: a deterministic, explainable feature model (recency ×
-   weight of signals — funding ↑, layoffs ↓, relevant hiring ↑, competitor displacement
-   risk ↓, ICP fit) + an LLM adjustment layer. Emits 0–100 + per-factor contributions +
-   a plain-English "why". This *is* the predictive ranking.
-3. **Competitive-intelligence agent** — targeted research for competitor mentions,
-   pricing, review-site comparisons, tech stack → per-account `CompetitiveInsight`s and a
-   market-level win/lose/undercut rollup.
-4. **Next-best-action agent** — consumes score + signals + competitive position + deal
-   stage → a *ranked* list of concrete actions, each with a rationale
-   ("send case study X — they just raised a Series B and are hiring 5 SDRs").
-5. **Action-executor agents** — turn approved actions into real side effects: draft &
-   (on approval) send outreach, draft LinkedIn message, create follow-up task, generate a
-   deal battle-card / one-pager, update record fields.
+## 3. Learning engine (post-mortem driven)
 
-**Orchestrator** fans out enrichment → scoring → competitive → NBA per account, then
-stages actions. Built on the durable runner so sweeps survive restarts.
+- Closing a deal (won **or** lost) requires a lightweight **post-mortem**: outcome,
+  fit assessment (good fit / bad fit / unsure), primary reason
+  (`lost_to_competitor · bad_fit · pricing · timing_budget · champion_left · went_dark ·
+  won_displaced_competitor · won_greenfield · won_relationship`), competitor if any,
+  free-text notes. The account's **rubric snapshot is frozen onto the deal at close**.
+- Admin **Learning view**: per factor, win-rate among closed deals *with* the factor vs
+  *without* → lift → **proposed** weight adjustment.
+- **Gate:** proposals unlock only after ≥ 50 closed deals with post-mortems (manual-review
+  critical mass). A human approves every weight change; nothing auto-mutates. Full history kept.
+- Post-mortem *reasons* feed back too: e.g., repeated `bad_fit` losses sharing a factor
+  profile push that profile's weights down even when the rubric scored them hot.
+- **Demo:** seed ~80 simulated historical closed deals with plausible outcome/factor
+  correlations so the retuning moment is showable live.
 
-### Autonomy & safety gate
-- **Autonomous (reversible/internal):** enrichment, scoring, generating drafts &
-  battle-cards, creating internal tasks, updating record fields.
-- **Approval-gated (outbound/irreversible):** sending any email/message, anything that
-  leaves the system. Staged for one-click rep approval — never sent silently.
-- Full agent-run audit log + every fact sourced + factor-level score explainability =
-  a CRM a rep can actually trust.
+## 4. Rep experience (nudges, not homework)
 
-## 4. Screens
+- **Pipeline efficiency:** each rep's open deals ranked by score × stage-weighted value;
+  warnings when time is going to low-score accounts ("efficiency score").
+- **Relationship override:** an engaged, progressing deal is never auto-deprioritized by
+  rubric score alone — momentum (recent activity) beats static score; flags, not blocks.
+- **Nudges feed:** "New DON at Maplewood Care (score 82) — reach out this week", with the
+  *why* attached.
 
-1. **Pipeline / ranking** — accounts ranked by predictive score: band, top signal, and the
-   #1 next-best-action inline. The money view.
-2. **Account detail** — enriched record: overview · live signal timeline (with sources) ·
-   score breakdown (factor bars) · competitive position · ranked NBAs with "Approve & run"
-   · agent-run trace.
-3. **Competitive intelligence** — market view of win / lose / undercut by competitor, with
-   evidence.
-4. **Agent activity feed** — live streaming runs, staged actions awaiting approval, audit trail.
-5. **Command bar** — NL over the fleet: "Enrich Acme", "Who's most likely to convert this
-   week?", "Draft outreach for the top 3".
+## 5. MVP scope (hackathon)
 
-## 5. Phased build plan
+**Must:** accounts / people / deals tables · pipeline view · enrichment/search view over
+the CMS-seeded universe ranked by rubric score · account detail with score breakdown ·
+rubric admin (edit weights) · post-mortem flow on deal close · learning view with
+simulated history · NL chatbot over the data (Anthropic).
+**Nice:** weighted forecast, funnel, nudges feed, live Apollo pulls.
+**Later (Adam, downstream):** auto-generated **HTML pitch book** per account for sales
+meetings — consumes the same account + signals + competitive data. Parked for brainstorm.
 
-- **Phase 0 — Scaffold.** Next.js + TS + Tailwind + shadcn; Drizzle + SQLite; env for
-  Claude + search keys; seed a handful of *real* target accounts (name + domain only —
-  everything else gets enriched live).
-- **Phase 1 — Enrichment pipeline (live web).** Enrichment agent + account detail with
-  sourced signal timeline. On-demand "Enrich" first.
-- **Phase 2 — Predictive scoring.** Feature extraction → hybrid score → explainable
-  factors → pipeline ranking view.
-- **Phase 3 — Competitive intelligence.** Competitive agent + market view.
-- **Phase 4 — Next-best-action + execution.** NBA agent; action staging + approval gate;
-  executors (draft email, create task, battle-card); live agent activity feed.
-- **Phase 5 — Command bar + polish + deploy.** NL command bar; streaming; demo seed;
-  Vercel + Neon.
+## 6. Stack & repo layout
 
-## 6. Open decisions (need a call before Phase 1)
+- **Next.js 15 (App Router) + TypeScript + Tailwind** — hand-rolled UI components (no
+  component-lib yak-shaving)
+- **SQLite via Drizzle ORM** (`data/crm.db`, gitignored; rebuildable from `npm run ingest` + `npm run seed`)
+- **Anthropic API** for chatbot + fuzzy enrichment; key in `.env.local` (gitignored — see `.env.example`)
+- `scripts/ingest-cms.ts` — pulls CMS provider data → accounts
+- `scripts/seed.ts` — rubric v1, simulated reps/deals/post-mortems
+- `src/lib/rubric/` — scoring engine (pure functions, unit-testable)
+- `src/lib/connectors/` — `cms.ts` (live), `apollo.ts` / `apify.ts` (typed stubs)
 
-1. **Search provider** — Anthropic native web search vs Exa/Tavily. *(Recommend Exa.)*
-2. **Job runner** — Inngest vs simple cron for the prototype. *(Recommend Inngest.)*
-3. **DB target** — SQLite-only for the demo vs Postgres/Neon from day one. *(Recommend
-   SQLite local, Postgres on deploy.)*
-4. **API keys** — need an Anthropic key + a search-provider key in `.env`.
+## 7. Division of labor (proposed)
+
+- **Pete + Claude (now):** CRM core — data layer, CMS ingest, rubric engine, learning
+  loop, CRM views, chatbot.
+- **Adam (on return):** pitch-book generator + Apollo/Apify keys → flip stubs live.
+- Solo-building window = commits straight to `main`; revisit branch/PR flow when both are
+  building.

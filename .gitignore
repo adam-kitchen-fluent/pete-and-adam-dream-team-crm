@@ -1,0 +1,18 @@
+# deps / build
+node_modules/
+.next/
+out/
+
+# env & secrets — never commit
+.env
+.env.*
+!.env.example
+
+# local data
+data/*.db
+data/*.db-journal
+data/cache/
+
+# misc
+.DS_Store
+*.log
